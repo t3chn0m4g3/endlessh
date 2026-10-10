@@ -171,6 +171,11 @@ client_new(int fd, long long send_next)
     return c;
 }
 
+/* When accept() ran out of file descriptors, the listener rests until
+ * a client leaves or this time (epochms) has passed.
+ */
+static long long accept_retry;
+
 static void
 client_destroy(struct client *client)
 {
@@ -185,6 +190,7 @@ client_destroy(struct client *client)
     statistics.milliseconds += dt;
     close(client->fd);
     free(client);
+    accept_retry = 0;
 }
 
 static void
@@ -952,7 +958,10 @@ main(int argc, char **argv)
 
         /* Wait for next event */
         struct pollfd fds = {server, POLLIN, 0};
-        int nfds = fifo->length < config.max_clients;
+        int resting = accept_retry > now;
+        int nfds = fifo->length < config.max_clients && !resting;
+        if (resting && (timeout < 0 || timeout > accept_retry - now))
+            timeout = accept_retry - now;
         logmsg(log_debug, "poll(%d, %d)", nfds, timeout);
         int r = poll(&fds, nfds, timeout);
         logmsg(log_debug, "= %d", r);
@@ -971,16 +980,22 @@ main(int argc, char **argv)
         if (fds.revents & POLLIN) {
             int fd = accept(server, 0, 0);
             logmsg(log_debug, "accept() = %d", fd);
-            statistics.connects++;
             if (fd == -1) {
                 const char *msg = strerror(errno);
+                static long long warned;
+                long long t;
                 switch (errno) {
                     case EMFILE:
                     case ENFILE:
-                        config.max_clients = fifo->length;
-                        logmsg(log_info,
-                                "MaxClients %d",
-                                fifo->length);
+                        /* MaxClients stays, accept() is tried again */
+                        t = epochms();
+                        accept_retry = t + 1000;
+                        if (!warned || t - warned >= 3600000) {
+                            fprintf(stderr, "endlessh: warning: %s at %d "
+                                    "clients, waiting for one to leave\n",
+                                    msg, fifo->length);
+                            warned = t;
+                        }
                         break;
                     case ECONNABORTED:
                     case EINTR:
@@ -994,6 +1009,7 @@ main(int argc, char **argv)
                         exit(EXIT_FAILURE);
                 }
             } else {
+                statistics.connects++;
                 long long send_next = epochms() + next_delay(&config, &rng);
                 struct client *client = client_new(fd, send_next);
                 int flags = fcntl(fd, F_GETFL, 0);      /* cannot fail */

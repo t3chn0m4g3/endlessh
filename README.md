@@ -16,12 +16,13 @@ trap multiple clients at a time.
 Usage information is printed with `-h`.
 
 ```
-Usage: endlessh [-vhs] [-d MS] [-f CONFIG] [-l LEN] [-m LIMIT] [-p PORT]
+Usage: endlessh [-vhs] [-d MS] [-f CONFIG] [-j MS] [-l LEN] [-m LIMIT] [-p PORT]
   -4        Bind to IPv4 only
   -6        Bind to IPv6 only
   -d INT    Message millisecond delay [10000]
   -f        Set and load config file [/etc/endlessh/config]
   -h        Print this help message and exit
+  -j INT    Random millisecond jitter of the delay [0]
   -l INT    Maximum banner line length (3-255) [32]
   -m INT    Maximum number of clients [4096]
   -p INT    Listening port [2222]
@@ -58,6 +59,11 @@ Port 2222
 # The endless banner is sent one line at a time. This is the delay
 # in milliseconds between individual lines.
 Delay 10000
+
+# Each delay is moved at random by up to this many milliseconds in
+# either direction (never below one millisecond). A fixed delay is
+# easy to spot for a client.
+Jitter 0
 
 # The length of each line is randomized. This controls the maximum
 # length of each line. Shorter lines may keep clients on for longer if

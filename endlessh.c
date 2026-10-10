@@ -30,6 +30,7 @@
 
 #define DEFAULT_PORT              2222
 #define DEFAULT_DELAY            10000  /* milliseconds */
+#define DEFAULT_JITTER               0  /* milliseconds */
 #define DEFAULT_MAX_LINE_LENGTH     32
 #define DEFAULT_MAX_CLIENTS       4096
 
@@ -255,6 +256,13 @@ rand16(unsigned long s[1])
     return (s[0] >> 16) & 0xffff;
 }
 
+static unsigned long long
+rand32(unsigned long s[1])
+{
+    unsigned long long hi = rand16(s);
+    return hi << 16 | rand16(s);
+}
+
 static int
 randline(char *line, int maxlen, unsigned long s[1])
 {
@@ -298,6 +306,7 @@ sigusr1_handler(int signal)
 struct config {
     int port;
     int delay;
+    int jitter;
     int max_line_length;
     int max_clients;
     int bind_family;
@@ -306,6 +315,7 @@ struct config {
 #define CONFIG_DEFAULT { \
     .port            = DEFAULT_PORT, \
     .delay           = DEFAULT_DELAY, \
+    .jitter          = DEFAULT_JITTER, \
     .max_line_length = DEFAULT_MAX_LINE_LENGTH, \
     .max_clients     = DEFAULT_MAX_CLIENTS, \
     .bind_family     = DEFAULT_BIND_FAMILY, \
@@ -339,6 +349,34 @@ config_set_delay(struct config *c, const char *s, int hardfail)
     } else {
         c->delay = tmp;
     }
+}
+
+static void
+config_set_jitter(struct config *c, const char *s, int hardfail)
+{
+    errno = 0;
+    char *end;
+    long tmp = strtol(s, &end, 10);
+    if (errno || *end || tmp < 0 || tmp > INT_MAX) {
+        fprintf(stderr, "endlessh: Invalid jitter: %s\n", s);
+        if (hardfail)
+            exit(EXIT_FAILURE);
+    } else {
+        c->jitter = tmp;
+    }
+}
+
+/* Delay until the next line: Delay, moved at random by up to Jitter in
+ * either direction, never below one millisecond.
+ */
+static long long
+next_delay(const struct config *c, unsigned long *rng)
+{
+    long long delay = c->delay;
+    long long jitter = c->jitter < c->delay ? c->jitter : c->delay - 1;
+    if (jitter > 0)
+        delay += (long long)(rand32(rng) % (2 * jitter + 1)) - jitter;
+    return delay;
 }
 
 static void
@@ -396,6 +434,7 @@ enum config_key {
     KEY_INVALID,
     KEY_PORT,
     KEY_DELAY,
+    KEY_JITTER,
     KEY_MAX_LINE_LENGTH,
     KEY_MAX_CLIENTS,
     KEY_LOG_LEVEL,
@@ -408,6 +447,7 @@ config_key_parse(const char *tok)
     static const char *const table[] = {
         [KEY_PORT]            = "Port",
         [KEY_DELAY]           = "Delay",
+        [KEY_JITTER]          = "Jitter",
         [KEY_MAX_LINE_LENGTH] = "MaxLineLength",
         [KEY_MAX_CLIENTS]     = "MaxClients",
         [KEY_LOG_LEVEL]       = "LogLevel",
@@ -472,6 +512,9 @@ config_load(struct config *c, const char *file, int hardfail)
                 case KEY_DELAY:
                     config_set_delay(c, tokens[1], hardfail);
                     break;
+                case KEY_JITTER:
+                    config_set_jitter(c, tokens[1], hardfail);
+                    break;
                 case KEY_MAX_LINE_LENGTH:
                     config_set_max_line_length(c, tokens[1], hardfail);
                     break;
@@ -505,6 +548,7 @@ config_log(const struct config *c)
 {
     logmsg(log_info, "Port %d", c->port);
     logmsg(log_info, "Delay %d", c->delay);
+    logmsg(log_info, "Jitter %d", c->jitter);
     logmsg(log_info, "MaxLineLength %d", c->max_line_length);
     logmsg(log_info, "MaxClients %d", c->max_clients);
     logmsg(log_info, "BindFamily %s",
@@ -516,8 +560,8 @@ config_log(const struct config *c)
 static void
 usage(FILE *f)
 {
-    fprintf(f, "Usage: endlessh [-vh] [-46] [-d MS] [-f CONFIG] [-l LEN] "
-                               "[-m LIMIT] [-p PORT]\n");
+    fprintf(f, "Usage: endlessh [-vh] [-46] [-d MS] [-f CONFIG] [-j MS] "
+                               "[-l LEN] [-m LIMIT] [-p PORT]\n");
     fprintf(f, "  -4        Bind to IPv4 only\n");
     fprintf(f, "  -6        Bind to IPv6 only\n");
     fprintf(f, "  -d INT    Message millisecond delay ["
@@ -525,6 +569,8 @@ usage(FILE *f)
     fprintf(f, "  -f        Set and load config file ["
             DEFAULT_CONFIG_FILE "]\n");
     fprintf(f, "  -h        Print this help message and exit\n");
+    fprintf(f, "  -j INT    Random millisecond jitter of the delay ["
+            XSTR(DEFAULT_JITTER) "]\n");
     fprintf(f, "  -l INT    Maximum banner line length (3-255) ["
             XSTR(DEFAULT_MAX_LINE_LENGTH) "]\n");
     fprintf(f, "  -m INT    Maximum number of clients ["
@@ -641,7 +687,7 @@ main(int argc, char **argv)
     config_load(&config, config_file, 1);
 
     int option;
-    while ((option = getopt(argc, argv, "46d:f:hl:m:p:svV")) != -1) {
+    while ((option = getopt(argc, argv, "46d:f:hj:l:m:p:svV")) != -1) {
         switch (option) {
             case '4':
                 config_set_bind_family(&config, "4", 1);
@@ -666,6 +712,9 @@ main(int argc, char **argv)
             case 'h':
                 usage(stdout);
                 exit(EXIT_SUCCESS);
+                break;
+            case 'j':
+                config_set_jitter(&config, optarg, 1);
                 break;
             case 'l':
                 config_set_max_line_length(&config, optarg, 1);
@@ -765,7 +814,7 @@ main(int argc, char **argv)
             if (fifo->head->send_next <= now) {
                 struct client *c = fifo_pop(fifo);
                 if (sendline(c, config.max_line_length, &rng)) {
-                    c->send_next = now + config.delay;
+                    c->send_next = now + next_delay(&config, &rng);
                     fifo_append(fifo, c);
                 }
             } else {
@@ -818,7 +867,7 @@ main(int argc, char **argv)
                         exit(EXIT_FAILURE);
                 }
             } else {
-                long long send_next = epochms() + config.delay;
+                long long send_next = epochms() + next_delay(&config, &rng);
                 struct client *client = client_new(fd, send_next);
                 int flags = fcntl(fd, F_GETFL, 0);      /* cannot fail */
                 fcntl(fd, F_SETFL, flags | O_NONBLOCK); /* cannot fail */

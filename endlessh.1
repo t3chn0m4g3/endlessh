@@ -9,6 +9,7 @@
 .Op Fl 46chsvV
 .Op Fl d Ar delay
 .Op Fl f Ar config
+.Op Fl j Ar jitter
 .Op Fl l Ar max banner length
 .Op Fl m Ar max clients
 .Op Fl p Ar port
@@ -47,6 +48,10 @@ By default
 looks for /etc/endlessh/config.
 .It Fl h
 Print the help message and exit.
+.It Fl j Ar jitter
+Random milliseconds jitter of the delay. Each delay is moved at random
+by up to this amount in either direction, but never below one
+millisecond. Default: 0
 .It Fl l Ar max banner length
 Maximum banner line length (3-255). Default: 32
 .It Fl m Ar max clients

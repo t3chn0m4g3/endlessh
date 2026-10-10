@@ -7,6 +7,7 @@
 .Sh SYNOPSIS
 .Nm endless
 .Op Fl 46chsvV
+.Op Fl b Ar file
 .Op Fl d Ar delay
 .Op Fl f Ar config
 .Op Fl j Ar jitter
@@ -39,6 +40,11 @@ to use IPv4 addresses only.
 Forces
 .Nm
 to use IPv6 addresses only.
+.It Fl b Ar file
+Send the lines of this file, one per delay, before the random ones.
+At most 32 lines of at most 253 printable ASCII characters each;
+a file that breaks these rules or cannot be read is ignored with a
+warning. A line starting with SSH- gets an X as its first character.
 .It Fl d Ar delay
 Message milliseconds delay. Default: 10000
 .It Fl f Ar config

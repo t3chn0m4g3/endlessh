@@ -42,6 +42,9 @@
 
 #define DEFAULT_BIND_FAMILY  AF_UNSPEC
 
+#define BANNER_MAX_LINES            32
+#define BANNER_MAX_LENGTH          253  /* plus CR LF */
+
 #define XSTR(s) STR(s)
 #define STR(s) #s
 
@@ -118,6 +121,8 @@ struct client {
     long long send_next;
     long long bytes_sent;
     struct client *next;
+    int banner_pos;
+    int banner_off;
     int port;
     int fd;
 };
@@ -132,6 +137,8 @@ client_new(int fd, long long send_next)
         c->send_next = send_next;
         c->bytes_sent = 0;
         c->next = 0;
+        c->banner_pos = 0;
+        c->banner_off = 0;
         c->fd = fd;
         c->port = 0;
 
@@ -276,6 +283,74 @@ randline(char *line, int maxlen, unsigned long s[1])
     return len;
 }
 
+/* Lines sent to every client before the random ones. */
+static struct {
+    int count;
+    int length[BANNER_MAX_LINES];
+    char line[BANNER_MAX_LINES][BANNER_MAX_LENGTH + 2];
+} banner;
+
+static void
+banner_load(const char *file)
+{
+    banner.count = 0;
+    if (!*file)
+        return;
+
+    FILE *f = fopen(file, "r");
+    if (!f) {
+        fprintf(stderr, "endlessh: warning: %s: %s, no banner\n",
+                file, strerror(errno));
+        return;
+    }
+
+    int count = 0;
+    long lineno = 0;
+    const char *problem = 0;
+    char buf[BANNER_MAX_LENGTH + 3];
+    while (fgets(buf, sizeof(buf), f)) {
+        lineno++;
+        size_t len = strlen(buf);
+        if (!(len && buf[len - 1] == '\n') && !feof(f)) {
+            problem = "line too long";
+            break;
+        }
+        while (len && (buf[len - 1] == '\n' || buf[len - 1] == '\r'))
+            len--;
+        if (len > BANNER_MAX_LENGTH) {
+            problem = "line too long";
+            break;
+        }
+        if (count == BANNER_MAX_LINES) {
+            problem = "more than " XSTR(BANNER_MAX_LINES) " lines";
+            break;
+        }
+        for (size_t i = 0; i < len && !problem; i++)
+            if (buf[i] < 32 || buf[i] > 126)
+                problem = "not printable ASCII";
+        if (problem)
+            break;
+
+        /* A line starting with SSH- would end the banner (RFC 4253) */
+        if (len >= 4 && memcmp(buf, "SSH-", 4) == 0)
+            buf[0] = 'X';
+        memcpy(banner.line[count], buf, len);
+        banner.line[count][len] = 13;
+        banner.line[count][len + 1] = 10;
+        banner.length[count] = len + 2;
+        count++;
+    }
+    if (!problem && ferror(f))
+        problem = "read error";
+    fclose(f);
+
+    if (problem)
+        fprintf(stderr, "endlessh: warning: %s:%ld: %s, no banner\n",
+                file, lineno, problem);
+    else
+        banner.count = count;
+}
+
 static volatile sig_atomic_t running = 1;
 
 static void
@@ -310,6 +385,7 @@ struct config {
     int max_line_length;
     int max_clients;
     int bind_family;
+    char banner_file[256];
 };
 
 #define CONFIG_DEFAULT { \
@@ -430,6 +506,19 @@ config_set_bind_family(struct config *c, const char *s, int hardfail)
   }
 }
 
+static void
+config_set_banner_file(struct config *c, const char *s, int hardfail)
+{
+    size_t len = strlen(s);
+    if (len >= sizeof(c->banner_file)) {
+        fprintf(stderr, "endlessh: Invalid banner file: %s\n", s);
+        if (hardfail)
+            exit(EXIT_FAILURE);
+    } else {
+        memcpy(c->banner_file, s, len + 1);
+    }
+}
+
 enum config_key {
     KEY_INVALID,
     KEY_PORT,
@@ -439,6 +528,7 @@ enum config_key {
     KEY_MAX_CLIENTS,
     KEY_LOG_LEVEL,
     KEY_BIND_FAMILY,
+    KEY_BANNER_FILE,
 };
 
 static enum config_key
@@ -451,7 +541,8 @@ config_key_parse(const char *tok)
         [KEY_MAX_LINE_LENGTH] = "MaxLineLength",
         [KEY_MAX_CLIENTS]     = "MaxClients",
         [KEY_LOG_LEVEL]       = "LogLevel",
-        [KEY_BIND_FAMILY]     = "BindFamily"
+        [KEY_BIND_FAMILY]     = "BindFamily",
+        [KEY_BANNER_FILE]     = "BannerFile"
     };
     for (size_t i = 1; i < sizeof(table) / sizeof(*table); i++)
         if (!strcmp(tok, table[i]))
@@ -524,6 +615,9 @@ config_load(struct config *c, const char *file, int hardfail)
                 case KEY_BIND_FAMILY:
                     config_set_bind_family(c, tokens[1], hardfail);
                     break;
+                case KEY_BANNER_FILE:
+                    config_set_banner_file(c, tokens[1], hardfail);
+                    break;
                 case KEY_LOG_LEVEL: {
                     errno = 0;
                     char *end;
@@ -555,15 +649,18 @@ config_log(const struct config *c)
         c->bind_family == AF_INET6 ? "IPv6 Only" :
         c->bind_family == AF_INET  ? "IPv4 Only" :
                                 "IPv4 Mapped IPv6");
+    if (c->banner_file[0])
+        logmsg(log_info, "BannerFile %s", c->banner_file);
 }
 
 static void
 usage(FILE *f)
 {
-    fprintf(f, "Usage: endlessh [-vh] [-46] [-d MS] [-f CONFIG] [-j MS] "
-                               "[-l LEN] [-m LIMIT] [-p PORT]\n");
+    fprintf(f, "Usage: endlessh [-vh] [-46] [-b FILE] [-d MS] [-f CONFIG] "
+                               "[-j MS] [-l LEN] [-m LIMIT] [-p PORT]\n");
     fprintf(f, "  -4        Bind to IPv4 only\n");
     fprintf(f, "  -6        Bind to IPv6 only\n");
+    fprintf(f, "  -b FILE   Send these lines before the random ones\n");
     fprintf(f, "  -d INT    Message millisecond delay ["
             XSTR(DEFAULT_DELAY) "]\n");
     fprintf(f, "  -f        Set and load config file ["
@@ -649,7 +746,20 @@ static struct client *
 sendline(struct client *client, int max_line_length, unsigned long *rng)
 {
     char line[256];
-    int len = randline(line, max_line_length, rng);
+    int len;
+    int from_banner = client->banner_pos < banner.count;
+    if (from_banner) {
+        /* The rest of a banner line a full socket did not take goes
+         * out next time (the banner may have shrunk on SIGHUP).
+         */
+        int full = banner.length[client->banner_pos];
+        if (client->banner_off >= full)
+            client->banner_off = 0;
+        len = full - client->banner_off;
+        memcpy(line, banner.line[client->banner_pos] + client->banner_off, len);
+    } else {
+        len = randline(line, max_line_length, rng);
+    }
     for (;;) {
         ssize_t out = write(client->fd, line, len);
         logmsg(log_debug, "write(%d) = %d", client->fd, (int)out);
@@ -665,6 +775,13 @@ sendline(struct client *client, int max_line_length, unsigned long *rng)
         } else {
             client->bytes_sent += out;
             statistics.bytes_sent += out;
+            if (from_banner) {
+                client->banner_off += out;
+                if (client->banner_off == banner.length[client->banner_pos]) {
+                    client->banner_pos++;
+                    client->banner_off = 0;
+                }
+            }
             return client;
         }
     }
@@ -687,13 +804,16 @@ main(int argc, char **argv)
     config_load(&config, config_file, 1);
 
     int option;
-    while ((option = getopt(argc, argv, "46d:f:hj:l:m:p:svV")) != -1) {
+    while ((option = getopt(argc, argv, "46b:d:f:hj:l:m:p:svV")) != -1) {
         switch (option) {
             case '4':
                 config_set_bind_family(&config, "4", 1);
                 break;
             case '6':
                 config_set_bind_family(&config, "6", 1);
+                break;
+            case 'b':
+                config_set_banner_file(&config, optarg, 1);
                 break;
             case 'd':
                 config_set_delay(&config, optarg, 1);
@@ -703,8 +823,6 @@ main(int argc, char **argv)
 
 #if defined(__OpenBSD__)
                 unveil(config_file, "r");
-                if (unveil(0, 0) == -1)
-                    die();
 #endif
 
                 config_load(&config, optarg, 1);
@@ -747,6 +865,13 @@ main(int argc, char **argv)
         exit(EXIT_FAILURE);
     }
 
+#if defined(__OpenBSD__)
+    if (config.banner_file[0])
+        unveil(config.banner_file, "r");
+    if (unveil(0, 0) == -1)
+        die();
+#endif
+
     if (logmsg == logsyslog) {
         /* Prepare the syslog */
         const char *prog = strrchr(argv[0], '/');
@@ -759,6 +884,7 @@ main(int argc, char **argv)
 
     /* Log configuration */
     config_log(&config);
+    banner_load(config.banner_file);
 
     /* Install the signal handlers */
     signal(SIGPIPE, SIG_IGN);
@@ -795,6 +921,7 @@ main(int argc, char **argv)
             int oldfamily = config.bind_family;
             config_load(&config, config_file, 0);
             config_log(&config);
+            banner_load(config.banner_file);
             if (oldport != config.port || oldfamily != config.bind_family) {
                 close(server);
                 server = server_create(config.port, config.bind_family);

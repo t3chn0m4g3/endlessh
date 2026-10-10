@@ -16,9 +16,10 @@ trap multiple clients at a time.
 Usage information is printed with `-h`.
 
 ```
-Usage: endlessh [-vhs] [-d MS] [-f CONFIG] [-j MS] [-l LEN] [-m LIMIT] [-p PORT]
+Usage: endlessh [-vhs] [-b FILE] [-d MS] [-f CONFIG] [-j MS] [-l LEN] [-m LIMIT] [-p PORT]
   -4        Bind to IPv4 only
   -6        Bind to IPv6 only
+  -b FILE   Send these lines before the random ones
   -d INT    Message millisecond delay [10000]
   -f        Set and load config file [/etc/endlessh/config]
   -h        Print this help message and exit
@@ -85,6 +86,11 @@ LogLevel 0
 #   4 = Use IPv4 only
 #   6 = Use IPv6 only
 BindFamily 0
+
+# Lines sent before the random ones, one per delay, as a server with a
+# login notice would. At most 32 lines of at most 253 printable ASCII
+# characters. Not set: random lines only.
+#BannerFile /etc/endlessh/banner
 ```
 
 ## Build issues

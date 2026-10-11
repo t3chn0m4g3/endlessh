@@ -575,10 +575,14 @@ config_key_parse(const char *tok)
 }
 
 static void
-config_load(struct config *c, const char *file, int hardfail)
+config_load(struct config *c, const char *file, int hardfail, int given)
 {
     long lineno = 0;
     FILE *f = fopen(file, "r");
+    if (!f && given) {
+        /* the default file may be missing, a file given with -f not */
+        fprintf(stderr, "endlessh: warning: %s: %s\n", file, strerror(errno));
+    }
     if (f) {
         char line[256];
         while (fgets(line, sizeof(line), f)) {
@@ -825,7 +829,8 @@ main(int argc, char **argv)
         die();
 #endif
 
-    config_load(&config, config_file, 1);
+    config_load(&config, config_file, 1, 0);
+    int config_given = 0;
 
     int option;
     while ((option = getopt(argc, argv, "46b:d:f:hj:l:m:p:svV")) != -1) {
@@ -849,7 +854,8 @@ main(int argc, char **argv)
                 unveil(config_file, "r");
 #endif
 
-                config_load(&config, optarg, 1);
+                config_load(&config, optarg, 1, 1);
+                config_given = 1;
                 break;
             case 'h':
                 usage(stdout);
@@ -942,7 +948,7 @@ main(int argc, char **argv)
             /* Configuration reload requested (SIGHUP) */
             int oldport = config.port;
             int oldfamily = config.bind_family;
-            config_load(&config, config_file, 0);
+            config_load(&config, config_file, 0, config_given);
             config_log(&config);
             banner_load(config.banner_file);
             if (oldport != config.port || oldfamily != config.bind_family) {

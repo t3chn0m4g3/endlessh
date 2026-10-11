@@ -371,8 +371,10 @@ banner_load(const char *file)
     if (problem)
         fprintf(stderr, "endlessh: warning: %s:%ld: %s, no banner\n",
                 file, lineno, problem);
-    else
+    else {
         banner.count = count;
+        logmsg(log_info, "BannerFile %s lines=%d", file, count);
+    }
 }
 
 static volatile sig_atomic_t running = 1;
@@ -677,8 +679,6 @@ config_log(const struct config *c)
         c->bind_family == AF_INET6 ? "IPv6 Only" :
         c->bind_family == AF_INET  ? "IPv4 Only" :
                                 "IPv4 Mapped IPv6");
-    if (c->banner_file[0])
-        logmsg(log_info, "BannerFile %s", c->banner_file);
 }
 
 static void

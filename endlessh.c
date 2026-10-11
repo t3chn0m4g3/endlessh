@@ -120,7 +120,6 @@ struct client {
     long long connect_time;
     long long send_next;
     long long bytes_sent;
-    struct client *next;
     int banner_pos;
     int banner_off;
     int port;
@@ -136,7 +135,6 @@ client_new(int fd, long long send_next)
         c->connect_time = epochms();
         c->send_next = send_next;
         c->bytes_sent = 0;
-        c->next = 0;
         c->banner_pos = 0;
         c->banner_off = 0;
         c->fd = fd;
@@ -193,66 +191,86 @@ client_destroy(struct client *client)
     accept_retry = 0;
 }
 
+/* Clients ordered by the time of their next line (a binary min-heap).
+ * With Jitter the gaps differ, so a queue in arrival order would let a
+ * client that is due late hold back the ones behind it.
+ */
+struct heap {
+    struct client **v;
+    int length;
+    int cap;
+};
+
+static int
+heap_push(struct heap *h, struct client *c)
+{
+    if (h->length == h->cap) {
+        if (h->cap > INT_MAX / 2)
+            return 0;
+        int cap = h->cap ? h->cap * 2 : 64;
+        struct client **v = realloc(h->v, cap * sizeof(*v));
+        if (!v)
+            return 0;
+        h->v = v;
+        h->cap = cap;
+    }
+    int i = h->length++;
+    while (i > 0) {
+        int parent = (i - 1) / 2;
+        if (h->v[parent]->send_next <= c->send_next)
+            break;
+        h->v[i] = h->v[parent];
+        i = parent;
+    }
+    h->v[i] = c;
+    return 1;
+}
+
+static struct client *
+heap_pop(struct heap *h)
+{
+    struct client *top = h->v[0];
+    struct client *last = h->v[--h->length];
+    int i = 0;
+    for (;;) {
+        int child = 2 * i + 1;
+        if (child >= h->length)
+            break;
+        if (child + 1 < h->length &&
+                h->v[child + 1]->send_next < h->v[child]->send_next)
+            child++;
+        if (last->send_next <= h->v[child]->send_next)
+            break;
+        h->v[i] = h->v[child];
+        i = child;
+    }
+    if (h->length)
+        h->v[i] = last;
+    return top;
+}
+
 static void
-statistics_log_totals(struct client *clients)
+heap_destroy(struct heap *h)
+{
+    for (int i = 0; i < h->length; i++)
+        client_destroy(h->v[i]);
+    free(h->v);
+    h->v = 0;
+    h->length = h->cap = 0;
+}
+
+static void
+statistics_log_totals(const struct heap *clients)
 {
     long long milliseconds = statistics.milliseconds;
-    for (long long now = epochms(); clients; clients = clients->next)
-        milliseconds += now - clients->connect_time;
+    long long now = epochms();
+    for (int i = 0; clients && i < clients->length; i++)
+        milliseconds += now - clients->v[i]->connect_time;
     logmsg(log_info, "TOTALS connects=%lld seconds=%lld.%03lld bytes=%lld",
            statistics.connects,
            milliseconds / 1000,
            milliseconds % 1000,
            statistics.bytes_sent);
-}
-
-struct fifo {
-    struct client *head;
-    struct client *tail;
-    int length;
-};
-
-static void
-fifo_init(struct fifo *q)
-{
-    q->head = q->tail = 0;
-    q->length = 0;
-}
-
-static struct client *
-fifo_pop(struct fifo *q)
-{
-    struct client *removed = q->head;
-    q->head = q->head->next;
-    removed->next = 0;
-    if (!--q->length)
-        q->tail = 0;
-    return removed;
-}
-
-static void
-fifo_append(struct fifo *q, struct client *c)
-{
-    if (!q->tail) {
-        q->head = q->tail = c;
-    } else {
-        q->tail->next = c;
-        q->tail = c;
-    }
-    q->length++;
-}
-
-static void
-fifo_destroy(struct fifo *q)
-{
-    struct client *c = q->head;
-    while (c) {
-        struct client *dead = c;
-        c = c->next;
-        client_destroy(dead);
-    }
-    q->head = q->tail = 0;
-    q->length = 0;
 }
 
 static void
@@ -913,8 +931,7 @@ main(int argc, char **argv)
             die();
     }
 
-    struct fifo fifo[1];
-    fifo_init(fifo);
+    struct heap heap = {0, 0, 0};
 
     unsigned long rng = epochms();
 
@@ -936,22 +953,22 @@ main(int argc, char **argv)
         }
         if (dumpstats) {
             /* print stats requested (SIGUSR1) */
-            statistics_log_totals(fifo->head);
+            statistics_log_totals(&heap);
             dumpstats = 0;
         }
 
         /* Enqueue clients that are due for another message */
         int timeout = -1;
         long long now = epochms();
-        while (fifo->head) {
-            if (fifo->head->send_next <= now) {
-                struct client *c = fifo_pop(fifo);
+        while (heap.length) {
+            if (heap.v[0]->send_next <= now) {
+                struct client *c = heap_pop(&heap);
                 if (sendline(c, config.max_line_length, &rng)) {
                     c->send_next = now + next_delay(&config, &rng);
-                    fifo_append(fifo, c);
+                    heap_push(&heap, c); /* cannot fail, one was popped */
                 }
             } else {
-                timeout = fifo->head->send_next - now;
+                timeout = heap.v[0]->send_next - now;
                 break;
             }
         }
@@ -959,7 +976,7 @@ main(int argc, char **argv)
         /* Wait for next event */
         struct pollfd fds = {server, POLLIN, 0};
         int resting = accept_retry > now;
-        int nfds = fifo->length < config.max_clients && !resting;
+        int nfds = heap.length < config.max_clients && !resting;
         if (resting && (timeout < 0 || timeout > accept_retry - now))
             timeout = accept_retry - now;
         logmsg(log_debug, "poll(%d, %d)", nfds, timeout);
@@ -993,7 +1010,7 @@ main(int argc, char **argv)
                         if (!warned || t - warned >= 3600000) {
                             fprintf(stderr, "endlessh: warning: %s at %d "
                                     "clients, waiting for one to leave\n",
-                                    msg, fifo->length);
+                                    msg, heap.length);
                             warned = t;
                         }
                         break;
@@ -1014,20 +1031,20 @@ main(int argc, char **argv)
                 struct client *client = client_new(fd, send_next);
                 int flags = fcntl(fd, F_GETFL, 0);      /* cannot fail */
                 fcntl(fd, F_SETFL, flags | O_NONBLOCK); /* cannot fail */
-                if (!client) {
+                if (!client || !heap_push(&heap, client)) {
                     fprintf(stderr, "endlessh: warning: out of memory\n");
                     close(fd);
+                    free(client);
                 } else {
-                    fifo_append(fifo, client);
                     logmsg(log_info, "ACCEPT host=%s port=%d fd=%d n=%d/%d",
                             client->ipaddr, client->port, client->fd,
-                            fifo->length, config.max_clients);
+                            heap.length, config.max_clients);
                 }
             }
         }
     }
 
-    fifo_destroy(fifo);
+    heap_destroy(&heap);
     statistics_log_totals(0);
 
     if (logmsg == logsyslog)
